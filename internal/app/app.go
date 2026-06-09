@@ -1,41 +1,23 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
-	"github.com/AlecAivazis/survey/v2"
-	term "github.com/AlecAivazis/survey/v2/terminal"
+	"charm.land/huh/v2"
+	"charm.land/huh/v2/spinner"
 	"github.com/Masterminds/semver/v3"
 	"github.com/apex/log"
-	"github.com/briandowns/spinner"
 	"github.com/fatih/color"
 	"golang.org/x/mod/modfile"
 
 	"github.com/oligot/go-mod-upgrade/internal/module"
 )
-
-func max(x, y int) int {
-	if x > y {
-		return x
-	}
-	return y
-}
-
-// MultiSelect that doesn't show the answer
-// It just reset the prompt and the answers are shown afterwards
-type MultiSelect struct {
-	survey.MultiSelect
-}
-
-func (m MultiSelect) Cleanup(config *survey.PromptConfig, val interface{}) error {
-	return m.Render("", nil)
-}
 
 type AppEnv struct {
 	Verbose  bool
@@ -131,13 +113,6 @@ func (app *AppEnv) Run() error {
 }
 
 func discoverModules(ignoreNames []string) ([]module.Module, error) {
-	s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
-	if err := s.Color("yellow"); err != nil {
-		return nil, err
-	}
-	s.Suffix = " Discovering modules..."
-	s.Start()
-
 	args := []string{
 		"list",
 		"-u",
@@ -152,14 +127,17 @@ func discoverModules(ignoreNames []string) ([]module.Module, error) {
 	// Disable Go workspace mode, otherwise this can cause trouble
 	// See issue https://github.com/oligot/go-mod-upgrade/issues/35
 	cmd.Env = append(os.Environ(), "GOWORK=off")
-	list, err := cmd.Output()
-	s.Stop()
 
-	// Clear line
-	fmt.Printf("\r%s\r", strings.Repeat(" ", len(s.Suffix)+1))
+	var list []byte
+	var cmdErr error
+	if err := spinner.New().Title(" Discovering modules...").Action(func() {
+		list, cmdErr = cmd.Output()
+	}).Run(); err != nil {
+		return nil, err
+	}
 
-	if err != nil {
-		return nil, fmt.Errorf("error running go command to discover modules: %w", err)
+	if cmdErr != nil {
+		return nil, fmt.Errorf("error running go command to discover modules: %w", cmdErr)
 	}
 
 	split := strings.Split(string(list), "\n")
@@ -200,14 +178,6 @@ func discoverModules(ignoreNames []string) ([]module.Module, error) {
 }
 
 func discoverTools(ignoreNames []string) ([]module.Module, error) {
-
-	s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
-	if err := s.Color("yellow"); err != nil {
-		return nil, err
-	}
-	s.Suffix = " Discovering tool modules..."
-	s.Start()
-
 	toolsArgs := []string{
 		"list",
 		"-f",
@@ -216,10 +186,14 @@ func discoverTools(ignoreNames []string) ([]module.Module, error) {
 	}
 	cmd := exec.Command("go", toolsArgs...)
 	cmd.Env = append(os.Environ(), "GOWORK=off")
-	toolsOutput, err := cmd.Output()
 
-	s.Stop()
-	fmt.Printf("\r%s\r", strings.Repeat(" ", len(s.Suffix)+1))
+	var toolsOutput []byte
+	var err error
+	if spinErr := spinner.New().Title(" Discovering tool modules...").Action(func() {
+		toolsOutput, err = cmd.Output()
+	}).Run(); spinErr != nil {
+		return nil, spinErr
+	}
 
 	if err != nil {
 		if strings.Contains(err.Error(), "matched no packages") {
@@ -358,22 +332,20 @@ func choose(modules []module.Module, pageSize int) []module.Module {
 		maxName = max(maxName, len(x.Name))
 		maxFrom = max(maxFrom, len(x.From.String()))
 	}
-	options := []string{}
-	for _, x := range modules {
+	options := []huh.Option[int]{}
+	for i, x := range modules {
 		from := x.FormatFrom(maxFrom)
-		option := fmt.Sprintf("%s %s -> %s", x.FormatName(maxName), from, x.FormatTo())
-		options = append(options, option)
-	}
-	prompt := &MultiSelect{
-		survey.MultiSelect{
-			Message:  "Choose which modules to update",
-			Options:  options,
-			PageSize: pageSize,
-		},
+		label := fmt.Sprintf("%s %s -> %s", x.FormatName(maxName), from, x.FormatTo())
+		options = append(options, huh.NewOption(label, i))
 	}
 	choice := []int{}
-	err := survey.AskOne(prompt, &choice)
-	if err == term.InterruptErr {
+	err := huh.NewMultiSelect[int]().
+		Title("Choose which modules to update").
+		Options(options...).
+		Height(pageSize).
+		Value(&choice).
+		Run()
+	if errors.Is(err, huh.ErrUserAborted) {
 		log.Info("Bye")
 		os.Exit(0)
 	} else if err != nil {
